@@ -1,9 +1,9 @@
 use std::collections::HashMap;
 use std::fmt::{self, Formatter};
 use std::fs::File;
-use std::io::{self, Read};
+use std::io::{self, BufRead};
 use std::path::Path;
-use std::{env, result, str};
+use std::{env, fs, result, str};
 
 use lazy_static::*;
 use regex::Regex;
@@ -37,48 +37,79 @@ macro_rules! error_from {
 
 error_from!(io::Error, "io error");
 
-struct OwnedCharIter {
-    chars: Vec<char>,
-    idx: usize,
+fn reverse_string(s: String) -> String {
+    s.chars().rev().collect()
 }
 
-impl OwnedCharIter {
-    fn new(source: String) -> OwnedCharIter {
-        OwnedCharIter {
-            chars: source.chars().collect(),
-            idx: 0,
-        }
+enum CharReaderState{
+    Reader(io::BufReader<fs::File>),
+    ReaderLine(io::BufReader<fs::File>, String),
+    Done,
+}
+
+struct CharReader {
+    state: Option<CharReaderState>
+}
+
+impl CharReader {
+    fn new(reader: io::BufReader<fs::File>) -> CharReader {
+        CharReader{state: Some(CharReaderState::Reader(reader))}
     }
 }
 
-impl Iterator for OwnedCharIter {
+impl Iterator for CharReader {
     type Item = char;
+
     fn next(&mut self) -> Option<Self::Item> {
-        if let Some(c) = self.chars.get(self.idx) {
-            self.idx += 1;
-            return Some(*c);
+        // Each call loops until a returnable state is reached.
+        // The outer match takes ownership of the state.
+        // Each branch MUST replace the state. To not do so is a logic error.
+        loop {
+            match self.state.take() {
+                // A branch has not replaced the state
+                None => panic!("none is not a valid state outside the next function"),
+
+                // The underlying reader reached its end state
+                Some(CharReaderState::Done) => {
+                    self.state = Some(CharReaderState::Done);
+                    return None
+                },
+
+                // There is an underlying reader but no line buffer so
+                // try to read a line and on success update the state
+                Some(CharReaderState::Reader(mut reader)) => {
+                    let mut buf = String::new();
+                    match reader.read_line(&mut buf) {
+                        Ok(0) => self.state = Some(CharReaderState::Done),
+                        Ok(_) => self.state = Some(CharReaderState::ReaderLine(reader, reverse_string(buf))),
+                        Err(e) => {
+                            self.state = Some(CharReaderState::Done);
+                            println!("error reading from underlying bufreader: {}", e);
+                            // this is bad because it hides the error from downstream but this is not real code so...
+                        }
+                    }
+                },
+
+                // There is a reader and a line buffer so try to pop a character from the
+                // line buffer and update the state, otherwise reset the state to having no current line buffer
+                Some(CharReaderState::ReaderLine(reader, mut line)) => {
+                    if let Some(c) = line.pop() {
+                        self.state = Some(CharReaderState::ReaderLine(reader, line));
+                        return Some(c)
+                    } else {
+                        self.state = Some(CharReaderState::Reader(reader))
+                    }
+                }
+            }
         }
-        None
-    }
-}
-
-trait OwnedChars {
-    fn owned_chars(self) -> OwnedCharIter;
-}
-
-impl OwnedChars for String {
-    fn owned_chars(self) -> OwnedCharIter {
-        OwnedCharIter::new(self)
     }
 }
 
 type Result<T> = result::Result<T, Error>;
 
-fn open_char_reader<P: AsRef<Path>>(filename: P) -> Result<OwnedCharIter> {
+fn open_char_reader<P: AsRef<Path>>(filename: P) -> Result<CharReader> {
     let file = File::open(filename)?;
-    let mut contents = String::new();
-    io::BufReader::new(file).read_to_string(&mut contents)?;
-    Ok(contents.owned_chars())
+    Ok(CharReader::new(io::BufReader::new(file)))
 }
 
 struct Pair {
@@ -93,11 +124,11 @@ impl Pair {
 }
 
 struct Tokens {
-    chars: OwnedCharIter,
+    chars: CharReader,
 }
 
 impl Tokens {
-    fn new(chars: OwnedCharIter) -> Tokens {
+    fn new(chars: CharReader) -> Tokens {
         Tokens { chars }
     }
 
@@ -144,7 +175,8 @@ trait IntoTokens {
     fn into_tokens(self) -> Tokens;
 }
 
-impl IntoTokens for OwnedCharIter {
+
+impl IntoTokens for CharReader {
     fn into_tokens(self) -> Tokens {
         Tokens::new(self)
     }
@@ -209,17 +241,13 @@ impl Passport {
     }
 
     fn is_valid(&self) -> bool {
-        let valid = self.is_valid_byr()
+        self.is_valid_byr()
             && self.is_valid_iyr()
             && self.is_valid_eyr()
             && self.is_valid_hgt()
             && self.is_valid_hcl()
             && self.is_valid_ecl()
-            && self.is_valid_pid();
-        if valid {
-            self._print()
-        }
-        valid
+            && self.is_valid_pid()
     }
 
     fn is_valid_byr(&self) -> bool {
